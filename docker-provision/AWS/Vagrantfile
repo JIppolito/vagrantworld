@@ -1,0 +1,225 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+
+require 'yaml'
+require 'fileutils'
+
+GO_VERSION = '1.6'.freeze
+
+# This vagrantfile will start up an environment for development testing that runs a docker host
+# at 192.168.100.100 and inside that host:
+# 1) A Consul server,
+# 2) A Vault server backed by Consul.
+# 3) A Postgres server registered in consul and a readonly role in vault.
+# 4) A Mysql server registered in consul and a readonly role in vault
+#
+# Both these containers will have ports forwarded to the host, so queries can be made to, e.g.,
+# Consul with `curl http://192.168.100.100:8500/v1/status/leader`
+#
+# Files in the same directory as this vagrant file will be mapped to /dev-config, and
+# the subdirectories of this directory should be configurations for the docker images of our
+# service dependencies.
+#
+# If PROJECT_PATH is specified, then the contents of that path will be mounted at /project.
+Vagrant.configure(2) do |config|
+  # make sure the vault-tokens folder exists.
+  FileUtils.mkdir('../vault-tokens') unless File.exist?('../vault-tokens')
+
+  # Probably in the long run we should read this environmentally, rather than
+  # just here, in the code.
+  # The idea is that vagrant will start and register all services, except
+  # those that are in the blacklist.
+  # The blacklist can be different every vagrant <up/reload/restart/whatever>
+  deps_to_install = ['consul', 'vault', 'rabbitmq', 'mysql', 'postgres', 'cassandra', 'goservice']
+  deps_to_blacklist = []
+
+  # may need to install the aws plugin: 
+  # $ vagrant plugin install vagrant-aws
+  config.vm.provider :aws do |aws, override|
+
+    config.vm.box = 'xcoo/trusty64'
+    #config.vm.box_url = 'https://github.com/mitchellh/vagrant-aws/raw/master/dummy.box'
+
+    # the following calls will raise errors if values are not found
+    aws.access_key_id = ENV['AWS_ACCESS_KEY_ID'] or raise "AWS_ACCESS_KEY_ID not provided"
+    aws.secret_access_key = ENV['AWS_SECRET_ACCESS_KEY'] or raise "AWS_SECRET_ACCESS_KEY not provided"
+    aws.region = ENV['AWS_DEFAULT_REGION'] or raise "AWS_DEFAULT_REGION not provided"
+    aws.ami = 'ami-c135f3aa'
+    override.ssh.username = 'vagrant'
+    aws.instance_type = 'm4.large'
+    aws.security_groups = [ ENV['SECURITY_GROUP'] ] or raise "SECURITY_GROUP not provided"
+    aws.associate_public_ip = true
+    aws.subnet_id = ENV['SUBNET'] or raise "SUBNET not provided"
+    aws.keypair_name = 'prod-vpc'
+    aws.ssh_host_attribute = 'private_ip_address'
+    aws.tags = {
+      'Name' => 'Vagrantworld',
+      'VAGRANTWORLD_TAG' => ENV['VAGRANTWORLD_TAG']
+    }
+  end
+
+  # Disable the default share
+  config.vm.synced_folder '.', '/vagrant', disabled: true
+  # But put it somewhere else
+  config.vm.synced_folder '..', '/dev-config'
+
+  config.vm.provision 'shell', inline: <<-SCRIPT
+    echo Installing golang
+    wget -q https://storage.googleapis.com/golang/go#{GO_VERSION}.linux-amd64.tar.gz
+    echo Golang downloaded
+    tar -C /usr/local -xzf go#{GO_VERSION}.linux-amd64.tar.gz
+    echo 'export PATH=$PATH:/usr/local/go/bin' >> /home/vagrant/.profile
+    echo Golang installed
+  SCRIPT
+
+  config.vm.provision 'shell', inline: <<-SCRIPT
+    mkdir -p /etc/docker/certs.d/docker-registry.MYHOST:5000/
+    cp /dev-config/certs/corp-ca.crt /etc/docker/certs.d/docker-registry.MYHOST:5000/ca.crt
+    cat /dev-config/certs/digicert-aws-ca.pem >> /etc/docker/certs.d/docker-registry.MYHOST:5000/ca.crt
+    chmod 400 /etc/docker/certs.d/docker-registry.MYHOST:5000/ca.crt
+  SCRIPT
+
+  config.vm.provision 'shell', inline: <<-SCRIPT
+    echo Installing db clients for data bootstrapping
+    apt-get update --fix-missing
+    apt-get -y install mysql-client
+    apt-get -y install postgresql-client
+    apt-get -y install ruby 1.9.3
+  SCRIPT
+
+  # config.vm.provision 'shell', inline: <<-SCRIPT
+  #   echo Allowing insecure local docker
+  #   echo 'Dpkg::Options {' >> /etc/apt/apt.conf.d/local
+  #   echo '  "--force-confdef";' >> /etc/apt/apt.conf.d/local
+  #   echo '  "--force-confold";' >> /etc/apt/apt.conf.d/local
+  #   echo '}' >> /etc/apt/apt.conf.d/local
+  #   echo 'DOCKER_OPTS="$DOCKER_OPTS --insecure-registry docker-registry.MYHOST:5000"' >> /etc/default/docker
+  #   echo Updated etc-default-docker
+  # SCRIPT
+
+  # Mount the project directory in /project if specified
+  if ENV.has_key? "PROJECT_PATH"
+    config.vm.synced_folder ENV["PROJECT_PATH"], "/project"
+    config.vm.provision 'shell',
+      inline: 'source /home/vagrant/.profile && [ -z "$GOPATH" ] && echo "export GOPATH=/project" >> /home/vagrant/.profile'
+  end
+
+  # Mirror the user's docker login to vagrant. This works, although security-wise it probably shouldn't.
+  config.vm.synced_folder "#{ENV["HOME"]}/.docker", "/root/.docker"
+
+  # Mirror the folder where we're writing the tokens.
+  config.vm.synced_folder '../vault-tokens', '/vault-tokens'
+  config.vm.synced_folder '../../gem', '/vagrantworld-gem'
+
+  # The scripts use the gem so we need to build it first.
+  config.vm.provision 'shell', inline: <<-SCRIPT
+    echo Building vagrantworld gem
+    cd /vagrantworld-gem
+    gem build vagrantworld.gemspec
+    gem install vagrantworld-0.0.1.gem
+  SCRIPT
+
+  previous_containers = []
+
+
+  # Try using docker-compose.yml without using docker-compose
+  config.vm.provision "docker" do |d|
+
+    deps_to_install.each do |dep|
+      configs = config_files(dep)
+      # Super hacky. Rewrite this to instead bypass setting string values if we don't have a compose file.
+      dock_config = File.exist?("../#{dep}/docker-compose.yml") ? YAML.load_file("../#{dep}/docker-compose.yml") : YAML.load("foo: bar")
+      ports = dock_config.has_key?('ports') ? "-p #{dock_config['ports'].join(' -p ')}" : ""
+      ports_list = dock_config.has_key?('ports') ? dock_config['ports'] : []
+      ports_list.each do |p|
+        config.vm.network 'forwarded_port', guest: p, host: p
+      end
+      links_list = previous_containers.length > 0 ? "--link='#{previous_containers.join("' --link='")}'" : ""
+      environment_list = read_environment(dock_config)
+      # Compose the arg_string. (So we can print out the line for debugging)
+      arg_string = "-h #{dep} -v /dev-config/#{dep}:/#{dep} -v /etc/hosts:/etc/hosts #{ports} #{links_list} #{environment_list}"
+
+      # puts "docker run #{arg_string} #{dock_config["image"]} #{dock_config["command"]}"
+      if not deps_to_blacklist.include? dep
+        d.run "#{dep}",
+          image: dock_config["image"],
+          cmd: dock_config["command"],
+          args: arg_string
+
+        # Append ip to hosts file
+        config.vm.provision "shell", inline: <<-SCRIPT
+          echo Updating host file for #{dep}
+          echo "$(docker inspect --format '{{ .NetworkSettings.IPAddress }}' #{dep}) #{dep}" >> /etc/hosts
+        SCRIPT
+
+        configs['init'].each do |script|
+          config.vm.provision 'shell', path: script
+        end
+
+        if configs["always"] != nil
+          config.vm.provision "shell", path: configs["always"], run: "always"
+        end
+        # always try to register if not blacklisted
+        if configs["register"] != nil
+          config.vm.provision "shell", path: configs["register"], run: "always", args: "up"
+        end
+        # Only add to previous container list if not blacklisted
+        previous_containers << dep
+
+      else # is blacklisted
+        # always try to deregister if blacklisted
+        if configs["register"] != nil
+          config.vm.provision "shell", path: configs["register"], run: "always", args: "down"
+        end
+      end
+    end
+  end
+
+end
+
+# Return a hash of the config files for
+# "register", "always", and "init". Init will always be an array (possibly empty).
+# "register" and "always" may not exist.
+def config_files(dep)
+  file_hash = {}
+  register_files = Dir.glob("../#{dep}/register*")
+  if register_files.length > 0
+    file_hash["register"] = register_files[0]
+  end
+
+  always_files = Dir.glob("../#{dep}/always*")
+  if always_files.length > 0
+    file_hash["always"] = always_files[0]
+  end
+
+  file_hash["init"] = Dir.glob("../#{dep}/init*").sort_by do |name|
+    name.downcase
+  end
+
+  return file_hash
+end
+
+# Environment can either be an array:
+#
+# environment:
+#   - "a=b"
+#   - "c=d"
+#
+# Or a map
+#
+# environment:
+#   a: "b"
+#   c: "d"
+def read_environment(dock_config)
+  if not dock_config.has_key?('environment')
+    return ""
+  end
+  environ = dock_config['environment']
+  if environ.is_a?(Array)
+    return "-e #{environ.join(' ')}"
+  elsif environ.is_a?(Hash)
+    return "-e #{environ.each_pair do |k,v| "#{k}=#{v}" end}"
+  else
+    return "-invalidparamtobreakdocker"
+  end
+end
